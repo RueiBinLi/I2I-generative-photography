@@ -310,7 +310,105 @@ class AnimationPipeline(DiffusionPipeline, LoraLoaderMixin):
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
+    
+    '''
+    SDEdit 新增的 Function
+    1. get_timesteps: 根據 strength 計算初始 timestep
+    2. prepare_latents_from_image: 從圖片產生初始 latents
+    3. 在 __call__ 裡面加入 SDEdit 的邏輯
+    '''
+    def get_timesteps(self, num_inference_steps, strength, device):
+        # 根據 strength 計算初始 timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
 
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+
+        return timesteps, num_inference_steps - t_start
+
+    def prepare_latents_from_image(self, image, batch_size, num_videos_per_prompt, video_length, dtype, device, generator=None):
+        if not isinstance(image, (torch.Tensor, list)):
+            raise ValueError(f"`image` has to be of type `torch.Tensor` or list but is {type(image)}")
+
+        # 1. 如果輸入是 Tensor (B, C, H, W)，移動到 device 並轉換 dtype
+        image = image.to(device=device, dtype=dtype)
+
+        # Support 5D Tensor (Video Input)
+        if image.ndim == 5: # (B, C, F, H, W)
+            b, c, f, h, w = image.shape
+            # Flatten to (B*F, C, H, W) for VAE
+            image_flat = rearrange(image, "b c f h w -> (b f) c h w")
+            
+            # VAE Encode
+            if isinstance(generator, list):
+                # Assuming generator list matches batch_size (b)
+                # We need to repeat generator for each frame if we want to be precise, 
+                # but usually generator is for the noise, here we are encoding.
+                # VAE encode is deterministic usually unless we sample. 
+                # latent_dist.sample uses generator.
+                # Let's just use the first generator or handle it simply.
+                # For now, let's assume generator is a single object or handle b*f expansion if needed.
+                # To be safe, let's just loop if it's a list.
+                init_latents_list = []
+                for i in range(b):
+                    # Get generator for this batch item
+                    gen = generator[i] if i < len(generator) else None
+                    # Encode frames for this batch item
+                    # image_flat[i*f : (i+1)*f]
+                    sub_batch = image_flat[i*f : (i+1)*f]
+                    encoded = self.vae.encode(sub_batch).latent_dist.sample(gen)
+                    init_latents_list.append(encoded)
+                init_latents = torch.cat(init_latents_list, dim=0)
+            else:
+                init_latents = self.vae.encode(image_flat).latent_dist.sample(generator)
+
+            init_latents = self.vae.config.scaling_factor * init_latents
+            
+            # Reshape back to (B, C, F, H, W)
+            # init_latents is now (B*F, C, H', W')
+            init_latents = rearrange(init_latents, "(b f) c h w -> b c f h w", b=b, f=f)
+            
+            # If video_length > f, we might need to repeat or pad?
+            # For now, assume f == video_length or we just use what we have.
+            # If f < video_length, we repeat the last frame?
+            if f < video_length:
+                diff = video_length - f
+                last_frame = init_latents[:, :, -1:, :, :]
+                padding = last_frame.repeat(1, 1, diff, 1, 1)
+                init_latents = torch.cat([init_latents, padding], dim=2)
+            elif f > video_length:
+                init_latents = init_latents[:, :, :video_length, :, :]
+                
+            return init_latents
+
+        # 2. VAE Encode (Original 4D Logic)
+        if isinstance(generator, list):
+            init_latents = [
+                self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+            ]
+            init_latents = torch.cat(init_latents, dim=0)
+        else:
+            init_latents = self.vae.encode(image).latent_dist.sample(generator)
+
+        init_latents = self.vae.config.scaling_factor * init_latents
+
+        # 3. 處理維度: (B, C, H, W) -> (B, C, F, H, W)
+        # 我們要把單張圖片複製，填滿整個 video_length，讓 Temporal Attention 有東西可以參考
+        if batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] == 0:
+            additional_image_per_prompt = batch_size // init_latents.shape[0]
+            init_latents = torch.cat([init_latents] * additional_image_per_prompt, dim=0)
+        elif batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] != 0:
+            raise ValueError(
+                f"Cannot duplicate `image` of batch size {init_latents.shape[0]} to {batch_size} text prompts."
+            )
+        else:
+            init_latents = torch.cat([init_latents], dim=0)
+
+        # 這裡將 (Batch, Channel, Height, Width) -> (Batch, Channel, Video_Length, Height, Width)
+        init_latents = init_latents.unsqueeze(2).repeat(1, 1, video_length, 1, 1)
+
+        return init_latents
+    
     @torch.no_grad()
     def __call__(
         self,
@@ -437,6 +535,7 @@ class AnimationPipeline(DiffusionPipeline, LoraLoaderMixin):
             return video
 
         return AnimationPipelineOutput(videos=video)
+    
 
 
 class GenPhotoPipeline(AnimationPipeline):
@@ -566,6 +665,7 @@ class GenPhotoPipeline(AnimationPipeline):
 
         return text_embeddings
 
+    # 在 GenPhotoPipeline 類別中
     @torch.no_grad()
     def __call__(
         self,
@@ -587,17 +687,16 @@ class GenPhotoPipeline(AnimationPipeline):
         callback_steps: Optional[int] = 1,
         multidiff_total_steps: int = 1,
         multidiff_overlaps: int = 12,
+        # --- 新增參數 ---
+        image: Optional[torch.FloatTensor] = None,
+        strength: float = 0.8,
         **kwargs,
     ):
-        # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        # Check inputs. Raise error if not correct
         self.check_inputs(prompt, height, width, callback_steps)
 
-        # Define call parameters
-        # batch_size = 1 if isinstance(prompt, str) else len(prompt)
         batch_size = 1
         if latents is not None:
             batch_size = latents.shape[0]
@@ -605,42 +704,86 @@ class GenPhotoPipeline(AnimationPipeline):
             batch_size = len(prompt)
 
         device = camera_embedding[0].device if isinstance(camera_embedding, list) else camera_embedding.device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        # Encode input prompt
         prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
         if negative_prompt is not None:
             negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size
         text_embeddings = self._encode_prompt(
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
-        )           # [2bf, l, c]
+        )
 
-        # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # Prepare latent variables
+        # --- I2V (SDEdit) Logic ---
+        if image is not None:
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            # [DEBUG]
+            print(f"\n[DEBUG] Strength: {strength}")
+            print(f"[DEBUG] New num_inference_steps: {num_inference_steps}")
+            if len(timesteps) > 0:
+                print(f"[DEBUG] Start Timestep (target_t): {timesteps[0]}")
+            else:
+                print(f"[DEBUG] WARNING: Timesteps is empty! Strength might be too low.")
+
         single_model_length = video_length
         video_length = multidiff_total_steps * (video_length - multidiff_overlaps) + multidiff_overlaps
         num_channels_latents = self.unet.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            video_length,
-            height,
-            width,
-            text_embeddings.dtype,
-            device,
-            generator,
-            latents,
-        )                   # b c f h w
-        latents_dtype = latents.dtype
+        
+        # Prepare Latents
+        if image is not None:
+            pixel_latents = self.prepare_latents_from_image(
+                image, batch_size * num_videos_per_prompt, num_videos_per_prompt, video_length, text_embeddings.dtype, device, generator
+            )
+            # [DEBUG] Check pixel_latents statistics
+            print(f"[DEBUG] Pixel Latents (Image) -> Mean: {pixel_latents.mean():.4f}, Std: {pixel_latents.std():.4f}")
+            
+            noise = torch.randn(pixel_latents.shape, generator=generator, device=device, dtype=text_embeddings.dtype)
+            
+            # [DEBUG] Check dimensions
+            bs, c, f, h, w = pixel_latents.shape
+            print(f"[DEBUG] Latents Shape: {pixel_latents.shape}")
 
-        # Prepare extra step kwargs.
+            target_t = timesteps[0]
+            
+            # Expand target_t to match batch size for safety (Diffusers bug workaround)
+            # Make sure target_t is a tensor of shape (B*F,)
+            if isinstance(target_t, torch.Tensor) and target_t.ndim == 0:
+                    target_t = target_t.repeat(bs * f)
+            elif isinstance(target_t, int) or isinstance(target_t, float):
+                    target_t = torch.tensor([target_t] * (bs * f), device=device)
+            
+            # Flatten for add_noise
+            pixel_latents_flat = rearrange(pixel_latents, "b c f h w -> (b f) c h w")
+            noise_flat = rearrange(noise, "b c f h w -> (b f) c h w")
+            
+            # Add Noise
+            latents_flat = self.scheduler.add_noise(pixel_latents_flat, noise_flat, target_t)
+            
+            # [DEBUG] Check Noisy Latents statistics
+            print(f"[DEBUG] Noisy Latents -> Mean: {latents_flat.mean():.4f}, Std: {latents_flat.std():.4f}")
+            
+            # Reshape back
+            latents = rearrange(latents_flat, "(b f) c h w -> b c f h w", b=bs, f=f)
+            
+        else:
+            latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                video_length,
+                height,
+                width,
+                text_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+        
+        latents_dtype = latents.dtype
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        
+        # Prepare Camera Embeddings
         if isinstance(camera_embedding, list):
             assert all([x.ndim == 5 for x in camera_embedding])
             bs = camera_embedding[0].shape[0]
@@ -652,19 +795,19 @@ class GenPhotoPipeline(AnimationPipeline):
         else:
             bs = camera_embedding.shape[0]
             assert camera_embedding.ndim == 5
-            camera_embedding_features = self.camera_encoder(camera_embedding)       # bf, c, h, w
+            camera_embedding_features = self.camera_encoder(camera_embedding)
             camera_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
-                                       for x in camera_embedding_features]
+                                        for x in camera_embedding_features]
 
-        # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         if isinstance(camera_embedding_features[0], list):
             camera_embedding_features = [[torch.cat([x, x], dim=0) for x in camera_embedding_feature]
-                                       for camera_embedding_feature in camera_embedding_features] \
+                                        for camera_embedding_feature in camera_embedding_features] \
                 if do_classifier_free_guidance else camera_embedding_features
         else:
             camera_embedding_features = [torch.cat([x, x], dim=0) for x in camera_embedding_features] \
-                if do_classifier_free_guidance else camera_embedding_features  # [2b c f h w]
+                if do_classifier_free_guidance else camera_embedding_features
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 noise_pred_full = torch.zeros_like(latents).to(latents.device)
@@ -679,16 +822,14 @@ class GenPhotoPipeline(AnimationPipeline):
                         camera_embedding_features_input = camera_embedding_features[multidiff_step]
                     else:
                         camera_embedding_features_input = [x[:, :, start_idx: start_idx + single_model_length]
-                                                         for x in camera_embedding_features]
+                                                            for x in camera_embedding_features]
 
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partial] * 2) if do_classifier_free_guidance else latent_partial   # [2b c f h w]
+                    latent_model_input = torch.cat([latent_partial] * 2) if do_classifier_free_guidance else latent_partial
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # predict the noise residual
                     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings,
-                                           camera_embedding_features=camera_embedding_features_input).sample.to(dtype=latents_dtype)
-                    # perform guidance
+                                            camera_embedding_features=camera_embedding_features_input).sample.to(dtype=latents_dtype)
+                    
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
@@ -697,19 +838,15 @@ class GenPhotoPipeline(AnimationPipeline):
                     start_idx = pred_idx * (single_model_length - multidiff_overlaps)
                     noise_pred_full[:, :, start_idx: start_idx + single_model_length] += noise_pred / mask_full[:, :, start_idx: start_idx + single_model_length]
 
-                # compute the previous noisy sample x_t -> x_t-1  b c f h w
                 latents = self.scheduler.step(noise_pred_full, t, latents, **extra_step_kwargs).prev_sample
 
-                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        # Post-processing
         video = self.decode_latents(latents)
 
-        # Convert to tensor
         if output_type == "tensor":
             video = torch.from_numpy(video)
 
