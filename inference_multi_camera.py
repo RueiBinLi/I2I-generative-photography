@@ -277,7 +277,7 @@ def load_models_inversion(cfg):
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None, help="Path to YAML config.")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config. If not provided, it will be auto-selected based on setting_type.")
     parser.add_argument("--setting_type", type=str, required=True, choices=['bokeh', 'focal', 'shutter', 'color'], help="Type of camera parameter")
     parser.add_argument("--base_scene", type=str, required=True, help="Prompt text")
     parser.add_argument("--param_list", type=str, required=True, help="JSON list of values, e.g., '[1.0, 5.0]'")
@@ -285,7 +285,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="outputs/ddim_multi_camera", help="Output directory")
     args = parser.parse_args()
 
-    # 自動選擇 Config
+    # 自動選擇 Config 邏輯
     default_config_map = {
         'bokeh': 'configs/inference_genphoto/adv3_256_384_genphoto_relora_bokehK.yaml',
         'focal': 'configs/inference_genphoto/adv3_256_384_genphoto_relora_focal_length.yaml',
@@ -299,43 +299,37 @@ def main():
             logger.info(f"✨ 偵測到未輸入 Config，已自動選用: {args.config}")
         else:
             raise ValueError(f"無法自動匹配 {args.setting_type} 的 Config，請手動輸入 --config")
-    
-    # 初始化
+    else:
+        config_name = args.config.lower()
+        type_map_check = {
+            'bokeh': 'bokeh',
+            'focal': 'focal_length',
+            'shutter': 'shutter_speed',
+            'color': 'color_temperature'
+        }
+        expected_keyword = type_map_check[args.setting_type]
+        if expected_keyword not in config_name:
+            logger.warning("================================================================")
+            logger.warning(f"⚠️  警告: 設定檔名稱 '{args.config}' 似乎與參數類型 '{args.setting_type}' 不符！")
+            logger.warning(f"預期設定檔應包含關鍵字: '{expected_keyword}'")
+            logger.warning("================================================================")
+
+    # 1. 初始化
     cfg = OmegaConf.load(args.config)
     pipeline, device = load_models_inversion(cfg)
     
-    # 影像處理
+    # 影像前處理
     raw_image = Image.open(args.input_image).convert("RGB").resize((384, 256))
     image_tensor = transforms.ToTensor()(raw_image).unsqueeze(0).to(device)
     image_tensor = image_tensor * 2.0 - 1.0
 
-    # 參數處理
+    # 2. 準備參數
     target_vals_list = json.loads(args.param_list)
     video_len = len(target_vals_list)
+    
+    initial_val = target_vals_list[0]
+    source_vals = torch.tensor([initial_val] * video_len, dtype=torch.float32)
     target_vals = torch.tensor(target_vals_list, dtype=torch.float32)
-
-    # =========================================================
-    # [關鍵修復] 定義 Inversion Source (基準值)
-    # 針對 Focal Length 與 Color 必須使用「標準物理狀態」而非「第一幀數值」
-    # =========================================================
-    if args.setting_type == 'focal':
-        # Focal Length 必須用 24.0 (Full View)，否則 Inversion 會被 Mask 遮擋導致全黑/損壞
-        source_val_item = 24.0 
-    elif args.setting_type == 'color':
-        # Color 必須用 5500.0 (白平衡基準)，否則 Inversion 會把色溫 bake 進去，導致生成時顏色變不動
-        source_val_item = 5500.0
-    elif args.setting_type == 'shutter':
-        # Shutter 用 0.5 (Base) 其實比較精確，但如果你覺得之前效果OK，維持 target_vals_list[0] 也可以
-        # 這裡我建議還是用 0.5 比較穩
-        source_val_item = 0.5 
-    elif args.setting_type == 'bokeh':
-        # Bokeh 如果原圖清晰，理論上是 0.0，但維持使用者輸入的第一幀通常也能運作
-        source_val_item = target_vals_list[0]
-    else:
-        source_val_item = target_vals_list[0]
-
-    logger.info(f"Using Inversion Source Value: {source_val_item} (Type: {args.setting_type})")
-    source_vals = torch.tensor([source_val_item] * video_len, dtype=torch.float32)
 
     # 建立 Embedding
     source_embed = Universal_Camera_Embedding(args.setting_type, source_vals, pipeline.tokenizer, pipeline.text_encoder, device).load()
@@ -344,8 +338,8 @@ def main():
     source_embed = rearrange(source_embed.unsqueeze(0), "b f c h w -> b c f h w")
     target_embed = rearrange(target_embed.unsqueeze(0), "b f c h w -> b c f h w")
 
-    # Inversion
-    logger.info(f"Running Inversion with STATIC {args.setting_type}...")
+    # 3. Inversion
+    logger.info(f"Running Inversion with STATIC {args.setting_type} (Val: {initial_val})...")
     inverted_latents = pipeline.invert(
         image=image_tensor,
         prompt=args.base_scene,
@@ -354,14 +348,8 @@ def main():
         video_length=video_len
     )
 
-    # Generation
+    # 4. Generation
     logger.info(f"Running Generation with DYNAMIC {args.setting_type}...")
-    
-    # 針對 Color Temperature 稍微提高 guidance_scale 可能有助於顏色變化更明顯
-    guidance_scale = 1.5
-    if args.setting_type == 'color':
-        guidance_scale = 2.0 
-
     with torch.no_grad():
         output = pipeline(
             prompt=args.base_scene,
@@ -370,16 +358,16 @@ def main():
             height=256,
             width=384,
             num_inference_steps=25,
-            guidance_scale=guidance_scale,
+            guidance_scale=1.5,
             latents=inverted_latents 
         ).videos[0]
 
-    # 存檔
+    # 5. 存檔
     timestamp = datetime.now().strftime("%H%M%S")
     save_dir = os.path.join(args.output_dir, args.setting_type)
     os.makedirs(save_dir, exist_ok=True)
     
-    save_path = os.path.join(save_dir, f"{timestamp}_val{target_vals_list[0]}_to_{target_vals_list[-1]}.gif")
+    save_path = os.path.join(save_dir, f"{timestamp}_val{initial_val}_to_{target_vals_list[-1]}.gif")
     save_videos_grid(output[None, ...], save_path)
     logger.info(f"Saved result to {save_path}")
 
